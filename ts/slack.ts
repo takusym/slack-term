@@ -303,8 +303,17 @@ export async function slackListsItemsCreate(
   token: string,
   listId: string,
   initialFields: Json[],
+  parentItemId?: string,
 ): Promise<Record<string, Json>> {
-  return (await post(token, "slackLists.items.create", { list_id: listId, initial_fields: initialFields })) as Record<string, Json>;
+  const body: Record<string, Json> = { list_id: listId, initial_fields: initialFields };
+  // a subtask of an existing row (Slack Lists nest rows under a parent; the parent is fixed at creation)
+  if (parentItemId) body.parent_item_id = parentItemId;
+  return (await post(token, "slackLists.items.create", body)) as Record<string, Json>;
+}
+
+/** Delete one row of a list (its subtasks go with it). */
+export async function slackListsItemsDelete(token: string, listId: string, rowId: string): Promise<Record<string, Json>> {
+  return (await post(token, "slackLists.items.delete", { list_id: listId, id: rowId })) as Record<string, Json>;
 }
 
 /** Grant access to a list: `user_ids` or `channel_ids` (Slack takes exactly one of them). */

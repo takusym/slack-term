@@ -65,6 +65,7 @@ import {
   slackListsAccessSet,
   slackListsCreate,
   slackListsItemsCreate,
+  slackListsItemsDelete,
   slackListsItemsList,
   slackListsItemsUpdate,
   history,
@@ -890,6 +891,7 @@ const SCOPE_FOR_METHOD: Record<string, string> = {
   "slackLists.create": "lists:write",
   "slackLists.items.create": "lists:write",
   "slackLists.items.update": "lists:write",
+  "slackLists.items.delete": "lists:write",
   "slackLists.items.list": "lists:read",
   "slackLists.access.set": "lists:write",
   "conversations.replies": "channels:history (or groups:history)",
@@ -3867,7 +3869,7 @@ async function cmdListsCreate(args: { name: string; cols: string[]; todo: boolea
   console.log(await listUrl(bot, listId));
 }
 
-async function cmdListsAdd(args: { list: string; text: string; sets: string[]; code?: string }): Promise<void> {
+async function cmdListsAdd(args: { list: string; text: string; sets: string[]; parent?: string; code?: string }): Promise<void> {
   const listId = parseListId(args.list);
   if (!listId) throw new Error(`Not a list ID or list URL: ${args.list}`);
   const bot = listsBotToken();
@@ -3877,17 +3879,19 @@ async function cmdListsAdd(args: { list: string; text: string; sets: string[]; c
   const pairs = [{ col: primary, value: args.text }, ...parseSets(args.sets).map((p) => ({ col: findColumn(cols, p.col), value: p.value }))];
   const fields = pairs.map((p) => ({ column_id: p.col.id, ...cellValue(p.col, p.value) }));
   const self = await selfIdentity(bot);
-  const code = safetyCode("lists-add", listId, JSON.stringify(fields), self?.userId ?? "");
+  if (args.parent !== undefined && !/^Rec[0-9A-Z]+$/.test(args.parent)) throw new Error(`--parent must be a row id (Rec…): ${args.parent}`);
+  const code = safetyCode("lists-add", listId, JSON.stringify(fields), args.parent ?? "", self?.userId ?? "");
   if (args.code !== code) requireCode(args.code, code, [
     `--- Adding a row to Slack List ---------------`,
     fromLine(self, { asBot: true, pad: 9 }),
     `  list:    ${listId}`,
+    ...(args.parent ? [`  parent:  ${args.parent} (subtask)`] : []),
     ...pairs.map((p) => `  ${(p.col.name || p.col.key).padEnd(8)} ${p.value}`),
     `--------------------------------────────────`,
   ]);
   let resp: Record<string, Json>;
   try {
-    resp = await slackListsItemsCreate(bot, listId, fields);
+    resp = await slackListsItemsCreate(bot, listId, fields, args.parent);
   } catch (e: unknown) {
     listWriteFail(e);
   }
@@ -3924,6 +3928,29 @@ async function cmdListsSet(args: { list: string; row: string; sets: string[]; do
     listWriteFail(e);
   }
   console.log(`✓ Updated row ${args.row}`);
+}
+
+async function cmdListsRm(args: { list: string; row: string; code?: string }): Promise<void> {
+  const listId = parseListId(args.list);
+  if (!listId) throw new Error(`Not a list ID or list URL: ${args.list}`);
+  if (!/^Rec[0-9A-Z]+$/.test(args.row)) throw new Error(`row must be a row id (Rec…): ${args.row}`);
+  const bot = listsBotToken();
+  await requireListsWrite(bot);
+  const self = await selfIdentity(bot);
+  const code = safetyCode("lists-rm", listId, args.row, self?.userId ?? "");
+  if (args.code !== code) requireCode(args.code, code, [
+    `--- Deleting a Slack List row (and its subtasks) ---`,
+    fromLine(self, { asBot: true, pad: 9 }),
+    `  list:    ${listId}`,
+    `  row:     ${args.row}`,
+    `--------------------------------────────────`,
+  ]);
+  try {
+    await slackListsItemsDelete(bot, listId, args.row);
+  } catch (e: unknown) {
+    listWriteFail(e);
+  }
+  console.log(`✓ Deleted row ${args.row}`);
 }
 
 async function cmdListsShare(args: { list: string; users: string[]; channels: string[]; level: "read" | "write" | "owner"; code?: string }): Promise<void> {
@@ -5379,10 +5406,12 @@ async function main(): Promise<void> {
             .positional("list", { type: "string", demandOption: true, describe: "List URL or F-id" })
             .positional("text", { type: "string", demandOption: true, describe: "Primary (first text) column value" })
             .option("set", { type: "string", array: true, default: [], describe: "Other cells: column=value (repeatable)" })
+            .option("parent", { type: "string", describe: "Add as a subtask of this row (Rec…); Slack fixes the parent at creation" })
             .option("code", { type: "string", describe: "Safety hash to confirm add" }),
           async (argv) => {
             try {
-              const a: { list: string; text: string; sets: string[]; code?: string } = { list: argv.list!, text: argv.text!, sets: argv.set as string[] };
+              const a: { list: string; text: string; sets: string[]; parent?: string; code?: string } = { list: argv.list!, text: argv.text!, sets: argv.set as string[] };
+              if (argv.parent !== undefined) a.parent = argv.parent;
               if (argv.code !== undefined) a.code = argv.code;
               await cmdListsAdd(a);
             } catch (e: unknown) {
@@ -5406,6 +5435,24 @@ async function main(): Promise<void> {
               if (argv.done !== undefined) a.done = argv.done;
               if (argv.code !== undefined) a.code = argv.code;
               await cmdListsSet(a);
+            } catch (e: unknown) {
+              console.error(friendlySlackError(e));
+              process.exit(1);
+            }
+          },
+        )
+        .command(
+          "rm <list> <row>",
+          "Delete a Slack List row and its subtasks (confirm-hash safety gate; bot token)",
+          (y2) => y2
+            .positional("list", { type: "string", demandOption: true, describe: "List URL or F-id" })
+            .positional("row", { type: "string", demandOption: true, describe: "Row id (Rec…)" })
+            .option("code", { type: "string", describe: "Safety hash to confirm delete" }),
+          async (argv) => {
+            try {
+              const a: { list: string; row: string; code?: string } = { list: argv.list!, row: argv.row! };
+              if (argv.code !== undefined) a.code = argv.code;
+              await cmdListsRm(a);
             } catch (e: unknown) {
               console.error(friendlySlackError(e));
               process.exit(1);
